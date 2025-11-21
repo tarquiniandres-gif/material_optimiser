@@ -175,14 +175,24 @@ paste_df = None
 uploaded_df = None
 
 with tab1:
-    paste_text = st.text_area("Paste BOM here", height=220)
+    st.subheader("Paste BOM (or edit table)")
+    paste_text = st.text_area("Paste BOM from Excel (with headers)", height=220)
+
     if paste_text.strip():
         try:
-            paste_df = try_parse_paste(paste_text)
-            st.success("Parsed pasted BOM.")
-            st.dataframe(paste_df.head(), use_container_width=True)
+            lines = paste_text.strip().split("\n")
+            # detect separator: tab or comma
+            sep = "\t" if "\t" in lines[0] else ","
+            # convert to DataFrame
+            df_temp = pd.DataFrame([l.split(sep) for l in lines[1:]], columns=lines[0].split(sep))
+            # strip spaces from column names
+            df_temp.columns = [c.strip() for c in df_temp.columns]
+            # editable table
+            st.write("✅ Review / edit pasted BOM below")
+            paste_df = st.data_editor(df_temp, num_rows="dynamic")
         except Exception as e:
-            st.error(str(e))
+            st.error(f"Error parsing pasted BOM: {e}")
+
 
 with tab2:
     uploaded_file = st.file_uploader("Upload BOM file", type=["xlsx","xls","csv"])
