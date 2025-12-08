@@ -1,10 +1,12 @@
+# streamlit_app.py
 import streamlit as st
 import pandas as pd
-from math import floor
+import math
+from io import StringIO, BytesIO
 
-st.set_page_config(page_title="Steel Optimiser", layout="wide")
+# === CONFIG ===
+WASTE_FACTOR = 1.03
 
-# Raw standard lengths
 RAW_STANDARD_LENGTHS = {
     "50X50X3SHS": 8000,
     "100X50X3RHS": 7000,
@@ -30,219 +32,415 @@ RAW_STANDARD_LENGTHS = {
     "200PFC": None
 }
 
-# -----------------------------------------
-# SESSION STATE INITIALIZATION
-# -----------------------------------------
+RAW_STOCK_LIST = [
+    "100X50X3RHS",
+    "75X50X3RHS",
+    "40X40X2.5RHS",
+    "65X35X2.5RHS",
+    "40X40X5EA",
+    "⌀6BAR",
+    "⌀12BAR"
+]
 
-if "material_lengths" not in st.session_state:
-    st.session_state.material_lengths = RAW_STANDARD_LENGTHS.copy()
+# --- normalise helper (for Description -> key)
+def normalise(text):
+    if not isinstance(text, str):
+        return ""
+    s = text.upper()
+    s = s.replace(" ", "")
+    s = s.replace("-", "")
+    s = s.replace("/", "")
+    s = s.replace("\u00D8", "⌀")  # Ø variants
+    s = s.replace("Ø", "⌀")
+    # Keep X as is. Remove stray multiple spaces handled earlier.
+    return s
 
+# Prepare standard dict keyed by normalised keys
+STANDARD_LENGTHS = {normalise(k): v for k, v in RAW_STANDARD_LENGTHS.items()}
+STOCK_LIST = [normalise(k) for k in RAW_STOCK_LIST]
+
+# --- Streamlit session-state safe initialisation
+st.set_page_config(page_title="Steel Optimiser", layout="wide")
+if "std_overrides" not in st.session_state:
+    # stores user overrides: desc_norm -> int (mm) or "CUT"
+    st.session_state.std_overrides = {}
+if "custom_materials" not in st.session_state:
+    st.session_state.custom_materials = {}  # desc_norm -> int or None
 if "paste_df" not in st.session_state:
     st.session_state.paste_df = None
-
 if "uploaded_df" not in st.session_state:
     st.session_state.uploaded_df = None
 
-
-# -----------------------------------------
-# HELPERS
-# -----------------------------------------
-
-def parse_pasted_table(text):
-    """
-    Converts pasted Excel BOM text into a DataFrame (tab or comma separated).
-    """
-    lines = text.strip().split("\n")
-    if len(lines) < 2:
-        raise ValueError("Not enough lines detected.")
-
-    sep = "\t" if "\t" in lines[0] else ","
-    columns = [c.strip() for c in lines[0].split(sep)]
-    rows = [l.split(sep) for l in lines[1:]]
-    df = pd.DataFrame(rows, columns=columns)
-
-    return df
-
-
-def optimise_material(material, df):
-
-    std_length = st.session_state.material_lengths.get(material)
-
-    if std_length is None or std_length == 0:
-        return {
-            "material": material,
-            "std_length": None,
-            "qty_required": None,
-            "cuts": [],
-            "message": "⚠️ No standard length defined. Please set it above."
-        }
-
-    cuts = df["Length"].astype(float).tolist()
-    cuts_sorted = sorted(cuts, reverse=True)
-
+# --- helper algorithms
+def best_fit_decreasing(cuts, bar_length):
+    """Simple BFD bin packing (greedy). cuts: list of ints, bar_length: int"""
+    cuts = sorted(cuts, reverse=True)
     bars = []
-    current_bar = []
+    for cut in cuts:
+        placed = False
+        for bar in bars:
+            if sum(bar) + cut <= bar_length:
+                bar.append(cut)
+                placed = True
+                break
+        if not placed:
+            bars.append([cut])
+    return bars
 
-    remaining = std_length
+def optimise_cuts(cut_lengths, std_length):
+    if std_length is None:
+        # cut-to-length: everything is treated as one-off
+        total_length = sum(cut_lengths)
+        return 1, [0], [cut_lengths]
+    bars = best_fit_decreasing(cut_lengths, std_length)
+    offcuts = [std_length - sum(bar) for bar in bars]
+    return len(bars), offcuts, bars
 
-    for cut in cuts_sorted:
-        if cut <= remaining:
-            current_bar.append(cut)
-            remaining -= cut
+# --- parsing pasted text robustly
+def try_parse_paste(paste_text):
+    txt = paste_text.strip()
+    if not txt:
+        raise ValueError("Empty paste.")
+    # try common separators
+    for sep in ["\t", ",", ";"]:
+        try:
+            df = pd.read_csv(StringIO(txt), sep=sep)
+            cols = {c.strip().lower() for c in df.columns}
+            if {"description", "length", "qty"} <= cols:
+                return df
+        except Exception:
+            continue
+    # fallback: let pandas infer (commas)
+    try:
+        df = pd.read_csv(StringIO(txt))
+        cols = {c.strip().lower() for c in df.columns}
+        if {"description", "length", "qty"} <= cols:
+            return df
+    except Exception:
+        pass
+    # try manual splitting lines->tabs
+    lines = txt.splitlines()
+    header = lines[0]
+    sep = "\t" if "\t" in header else ","
+    df = pd.DataFrame([l.split(sep) for l in lines[1:]], columns=[h.strip() for h in header.split(sep)])
+    cols = {c.strip().lower() for c in df.columns}
+    if {"description", "length", "qty"} <= cols:
+        return df
+    raise ValueError("Could not parse pasted BOM. Ensure headers include Description, Length, Qty.")
+
+# --- UI Header
+st.title("🔩 Steel Optimiser — Paste or Upload BOM")
+st.markdown("Paste a BOM copied from Excel (headers included) or upload a CSV/XLSX. Required columns: **Description, Length, Qty**. Optional: **Parent, Material**.")
+
+with st.expander("Sample minimal BOM (CSV/TSV)"):
+    st.code("Description,Material,Length,Qty,Parent\n50 x 50 x 3 SHS,Tubeline,1200,2,Parent A\n100 x 50 x 3 RHS,Tubeline,1500,3,Parent A\n50 x 50 x 3 SHS,Tubeline,1200,3,Parent B\n100 x 50 x 3 RHS,Tubeline,1500,2,Parent B")
+
+# --- Sidebar: default stock length and quick add material
+st.sidebar.subheader("Stock length / Overrides")
+default_stock_length = st.sidebar.number_input("Global default stock length (mm)", min_value=100, max_value=20000, value=6000, step=100)
+
+st.sidebar.markdown("**Session: add or override a material**")
+add_name = st.sidebar.text_input("Material Description (free text)", value="")
+add_len = st.sidebar.text_input("Stock length (mm) or type CUT", value="")
+if st.sidebar.button("Add / Override material (session)"):
+    key = normalise(add_name)
+    if not key:
+        st.sidebar.error("Enter a material description")
+    else:
+        v = add_len.strip().upper()
+        if v == "CUT":
+            st.session_state.std_overrides[key] = "CUT"
+            st.sidebar.success(f"{key} set to CUT-TO-LENGTH")
         else:
-            bars.append(current_bar)
-            current_bar = [cut]
-            remaining = std_length - cut
+            try:
+                num = int(float(v))
+                st.session_state.std_overrides[key] = num
+                st.sidebar.success(f"{key} -> {num} mm (override)")
+            except Exception:
+                st.sidebar.error("Invalid length. Use a number (mm) or CUT")
 
-    if current_bar:
-        bars.append(current_bar)
+# --- Input tabs (Paste / Upload)
+tab1, tab2 = st.tabs(["Paste BOM (recommended)", "Upload file"])
 
-    return {
-        "material": material,
-        "std_length": std_length,
-        "qty_required": len(bars),
-        "cuts": bars,
-        "message": "OK"
-    }
-
-
-# -----------------------------------------
-# UI START
-# -----------------------------------------
-
-st.title("🔩 Steel Material Optimiser")
-
-st.markdown("Paste your BOM or upload it below.")
-
-tab1, tab2 = st.tabs(["📋 Paste BOM", "📁 Upload File"])
-
-# ------------------------
-# TAB 1: PASTE BOM
-# ------------------------
 with tab1:
-    pasted = st.text_area("Paste BOM from Excel (with headers)", height=220)
-
-    if pasted.strip():
+    paste_text = st.text_area("Paste BOM here (copy from Excel with headers).", height=220)
+    if paste_text.strip():
         try:
-            df = parse_pasted_table(pasted)
-            df = st.data_editor(df, num_rows="dynamic")
-            st.session_state.paste_df = df
+            df_temp = try_parse_paste(paste_text)
+            # present editable table and save into session state for further processing
+            df_temp.columns = [c.strip() for c in df_temp.columns]
+            st.info("Review / edit pasted table below before processing.")
+            df_temp = st.data_editor(df_temp, num_rows="dynamic")
+            st.session_state.paste_df = df_temp
         except Exception as e:
-            st.error(f"Error parsing BOM: {e}")
+            st.error(str(e))
 
-# ------------------------
-# TAB 2: UPLOAD FILE
-# ------------------------
 with tab2:
-    file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
-
-    if file:
+    uploaded_file = st.file_uploader("Upload BOM (CSV or Excel)", type=["csv", "xlsx", "xls"])
+    if uploaded_file:
         try:
-            if file.name.endswith(".csv"):
-                df = pd.read_csv(file)
+            if uploaded_file.name.lower().endswith(".csv"):
+                df_up = pd.read_csv(uploaded_file)
             else:
-                df = pd.read_excel(file)
-
-            df = st.data_editor(df, num_rows="dynamic")
-            st.session_state.uploaded_df = df
+                df_up = pd.read_excel(uploaded_file)
+            df_up.columns = [c.strip() for c in df_up.columns]
+            df_up = st.data_editor(df_up, num_rows="dynamic")
+            st.session_state.uploaded_df = df_up
         except Exception as e:
-            st.error(f"Error loading file: {e}")
+            st.error(f"Error reading file: {e}")
 
-
-# -----------------------------------------
-# CHOOSE DF SOURCE
-# -----------------------------------------
-df_source = st.session_state.uploaded_df or st.session_state.paste_df
+# choose source
+df_source = st.session_state.paste_df if st.session_state.paste_df is not None else st.session_state.uploaded_df
 
 if df_source is None:
-    st.info("Please paste or upload a BOM to continue.")
+    st.info("Paste or upload a BOM to continue.")
     st.stop()
 
-st.header("🔢 Procurement Options")
+# ensure relevant columns exist (case-insensitive mapping)
+cols_map = {c.lower(): c for c in df_source.columns}
+required = {"description", "length", "qty"}
+if not required <= set(cols_map.keys()):
+    st.error("BOM must include Description, Length, and Qty columns (case-insensitive).")
+    st.stop()
 
-qty_turntables = st.number_input("How many turntables are we procuring for?", min_value=1, value=1)
-
-bundle_option = st.radio(
-    "Procurement mode:",
-    ["Bulk (all cuts combined)", "By Parent (each parent separately)"]
-)
-
-# Multiply quantities
-df_source["Qty"] = df_source["Qty"].astype(float) * qty_turntables
-
-# -----------------------------------------
-# MATERIAL LENGTH EDITOR
-# -----------------------------------------
-
-st.header("📏 Material Length Overrides")
-
-st.markdown("Adjust any bar length. Values are saved automatically.")
-
-for mat in sorted(st.session_state.material_lengths.keys()):
-    current = st.session_state.material_lengths[mat]
-
-    new_val = st.number_input(
-        f"{mat} length (mm)",
-        min_value=0,
-        step=100,
-        value=current if current else 0,
-        key=f"matlen_{mat}"
-    )
-
-    st.session_state.material_lengths[mat] = new_val if new_val > 0 else None
-
-
-st.divider()
-
-# -----------------------------------------
-# PROCESS BUTTON
-# -----------------------------------------
-
-if st.button("🚀 Process BOM"):
-    st.header("📦 Optimisation Results")
-
-    if bundle_option == "Bulk (all cuts combined)":
-    grouped = df_source.groupby("Material")
+# rename to consistent column names
+df_work = df_source.rename(columns={cols_map["description"]:"Description", cols_map["length"]:"Length", cols_map["qty"]:"Qty"})
+# optional Parent and Material
+if "parent" in cols_map:
+    df_work = df_work.rename(columns={cols_map["parent"]:"Parent"})
 else:
-    grouped = df_source.groupby(["Parent", "Material"])
+    df_work["Parent"] = ""
+if "material" in cols_map:
+    df_work = df_work.rename(columns={cols_map["material"]:"Material"})
+else:
+    df_work["Material"] = ""
 
-for group, subdf in grouped:
+# multiplier and procure mode
+st.sidebar.subheader("Procurement options")
+multiplier = st.sidebar.number_input("How many turntables are we procuring for?", min_value=1, value=1, step=1)
+procure_mode = st.sidebar.radio("Procure by", ["Bulk (group by Description)", "By Parent (bundle per Parent)"], index=0)
 
-    # -------- Determine material key --------
-    if isinstance(group, tuple):
-        parent, material_key = group
-        st.subheader(f"Parent: {parent} | Material: {material_key}")
+# apply multiplier to Qty (do not modify original types yet)
+try:
+    df_work["Qty"] = pd.to_numeric(df_work["Qty"], errors="coerce").fillna(0).astype(int) * int(multiplier)
+except Exception:
+    st.error("Qty column must be numeric.")
+    st.stop()
+
+# build list of unique normalised descriptions
+df_work["desc_norm"] = df_work["Description"].apply(normalise)
+unique_desc = df_work["desc_norm"].unique().tolist()
+
+st.header("Material length confirmation")
+st.markdown("Confirm or type a custom stock length for each normalised Description. Leave blank to use known standard or the global default. Type `CUT` to mark as cut-to-length.")
+
+# show a compact editor for each unique desc. Use session_state to persist user edits.
+for desc in unique_desc:
+    display_example = df_work.loc[df_work["desc_norm"] == desc, "Description"].iloc[0]
+    # compute current known standard
+    std_known = STANDARD_LENGTHS.get(desc)
+    override_val = st.session_state.std_overrides.get(desc, None)
+    # prepare displayed default text
+    default_str = ""
+    if override_val == "CUT":
+        default_str = "CUT"
+    elif override_val is not None:
+        default_str = str(override_val)
+    elif std_known is not None:
+        default_str = str(std_known)
     else:
-        material_key = group
-        st.subheader(f"Material: {material_key}")
+        default_str = ""
+    col_a, col_b = st.columns([4,2])
+    with col_a:
+        st.write(f"**{display_example}**  — key: `{desc}`")
+    with col_b:
+        inp = st.text_input(f"Length for {desc}", value=default_str, key=f"len_{desc}")
+        val = inp.strip().upper()
+        if val == "":
+            # remove override if exists so fallback to standard/default on processing
+            if desc in st.session_state.std_overrides:
+                st.session_state.std_overrides.pop(desc, None)
+        elif val == "CUT":
+            st.session_state.std_overrides[desc] = "CUT"
+        else:
+            # try parse number
+            try:
+                num = int(float(val))
+                st.session_state.std_overrides[desc] = num
+            except Exception:
+                st.warning(f"Ignoring invalid length for {desc}: '{inp}' (use number or CUT)")
 
-    # Validate numeric columns
-    try:
-        subdf2 = subdf.copy()
-        subdf2["Length"] = subdf2["Length"].astype(float)
-        subdf2["Qty"] = subdf2["Qty"].astype(float)
-    except:
-        st.error("Length & Qty must be numeric.")
-        continue
+st.markdown("---")
+st.write("Global default stock length (used when neither a standard nor an override exists):", default_stock_length, "mm")
 
-    # Expand quantities into individual cut entries
-    expanded = subdf2.loc[subdf2.index.repeat(subdf2["Qty"])]
+# --- PROCESS BUTTON
+if st.button("Process BOM"):
+    st.info("Processing — building BUY and CHECK lists...")
+    buy_rows = []
+    check_rows = []
+    warnings = []
 
-    # -------- Call optimiser with actual material key --------
-    result = optimise_material(material_key, expanded)
+    # Determine grouping
+    if procure_mode.startswith("By Parent"):
+        # group by Parent and Description (desc_norm)
+        group_keys = ["Parent", "desc_norm"]
+        grouped = df_work.groupby(group_keys, as_index=False)
+    else:
+        # Bulk: group by desc_norm only
+        grouped = df_work.groupby("desc_norm", as_index=False)
 
-    # Show message if no length
-    if result["std_length"] is None:
-        st.warning(result["message"])
-        continue
+    for group_key, group_df in grouped:
+        # find readable description
+        if procure_mode.startswith("By Parent"):
+            parent, desc_norm = group_key
+            readable = group_df["Description"].iloc[0]
+            parent_label = parent if parent not in (None, "") else "(No Parent)"
+            title_label = f"{parent_label} — {readable}"
+        else:
+            desc_norm = group_key
+            readable = group_df["Description"].iloc[0]
+            parent_label = None
+            title_label = f"{readable}"
 
-    st.write(f"Standard length: **{result['std_length']} mm**")
-    st.write(f"Bars required: **{result['qty_required']}**")
+        st.subheader(title_label)
 
-    # Show cut pattern
-    for i, cuts in enumerate(result["cuts"], start=1):
-        st.write(
-            f"Bar {i}: {cuts} → Used {sum(cuts)} mm | Waste {result['std_length'] - sum(cuts)} mm"
-        )
+        # Expand cuts according to Qty
+        try:
+            group_df["Length"] = pd.to_numeric(group_df["Length"], errors="coerce")
+            group_df["Qty"] = pd.to_numeric(group_df["Qty"], errors="coerce").fillna(0).astype(int)
+        except Exception:
+            st.error("Length and Qty must be numeric.")
+            continue
 
-    st.divider()
+        # Compose list of cut lengths (with waste)
+        cuts = []
+        for _, r in group_df.iterrows():
+            if pd.isna(r["Length"]) or r["Qty"] <= 0:
+                continue
+            length_mm = math.ceil(float(r["Length"]) * WASTE_FACTOR)
+            cuts.extend([int(length_mm)] * int(r["Qty"]))
+
+        if not cuts:
+            st.write("No valid cuts found in this group.")
+            continue
+
+        # Determine standard length for this desc_norm:
+        # priority: session overrides -> STANDARD_LENGTHS -> global default -> if override == 'CUT' => None
+        std_len = None
+        if desc_norm in st.session_state.std_overrides:
+            val = st.session_state.std_overrides[desc_norm]
+            if val == "CUT":
+                std_len = None
+            else:
+                try:
+                    std_len = int(val)
+                except Exception:
+                    std_len = STANDARD_LENGTHS.get(desc_norm)
+        else:
+            std_len = STANDARD_LENGTHS.get(desc_norm, None)
+
+        if std_len is None:
+            # if no standard and no override, use global default as fallback for optimisation,
+            # but we'll show that this was a fallback so user can see that it's not a "known standard"
+            used_len = default_stock_length
+            used_from = "GLOBAL DEFAULT"
+        else:
+            used_len = std_len
+            used_from = "STANDARD" if desc_norm in STANDARD_LENGTHS else "OVERRIDE"
+
+        # If user explicitly set CUT, then treat as cut-to-length and do not try to pack into bars
+        explicit_cut = (desc_norm in st.session_state.std_overrides and st.session_state.std_overrides[desc_norm] == "CUT")
+        if explicit_cut:
+            # treat as cut-to-length: don't attempt packing; each cut is its own piece
+            bars_needed = len(cuts)
+            offcuts = [0]*bars_needed
+            patterns = [[c] for c in cuts]
+            buy_rows.append({
+                "Parent": parent_label if parent_label else "(Bulk)",
+                "Description": readable,
+                "Standard Bar Length (mm)": "CUT-TO-LENGTH",
+                "Total Cuts": len(cuts),
+                "Bars Required": bars_needed,
+                "Avg Offcut (mm)": 0,
+                "Cutting Patterns": str(patterns)
+            })
+            st.write("Cut-to-length selected — no bar packing performed.")
+            st.write(f"Cuts: {cuts}")
+            continue
+
+        # Perform optimisation using used_len
+        bars_needed, offcuts, patterns = optimise_cuts(cuts, used_len)
+
+        avg_off = round(sum(offcuts) / len(offcuts), 1) if offcuts else 0
+
+        # If this description is in STOCK_LIST (stock materials), produce CHECK row
+        if desc_norm in STOCK_LIST:
+            total_length = sum(cuts)
+            approx_bars_equiv = round(total_length / (used_len or 1), 2)
+            check_rows.append({
+                "Parent": parent_label if parent_label else "(Bulk)",
+                "Description": readable,
+                "Total Length (mm)": total_length,
+                "Approx. Bars Equivalent": approx_bars_equiv,
+                "Used Stock Length (mm)": (used_len if std_len is not None else f"{used_len} (fallback)")
+            })
+            st.write("Stock material (CHECK):")
+            st.write(f"Total length: {total_length} mm  —  Approx bars: {approx_bars_equiv}")
+        else:
+            buy_rows.append({
+                "Parent": parent_label if parent_label else "(Bulk)",
+                "Description": readable,
+                "Standard Bar Length (mm)": used_len,
+                "Total Cuts": len(cuts),
+                "Bars Required": bars_needed,
+                "Avg Offcut (mm)": avg_off,
+                "Cutting Patterns": str(patterns)
+            })
+            st.write(f"Used stock length for optimisation: {used_len} mm ({used_from})")
+            st.write(f"Bars required: **{bars_needed}** — Avg offcut: {avg_off} mm")
+            # show patterns
+            for i, p in enumerate(patterns, start=1):
+                st.write(f"Bar {i}: {p} → used {sum(p)} mm | waste {used_len - sum(p)} mm")
+
+    # Build dataframes for export
+    buy_df = pd.DataFrame(buy_rows)
+    check_df = pd.DataFrame(check_rows)
+
+    st.markdown("---")
+    st.subheader("📦 BUY LIST")
+    if buy_df.empty:
+        st.write("No BUY items generated.")
+    else:
+        st.dataframe(buy_df, use_container_width=True)
+
+    st.subheader("📘 CHECK (Stock Materials)")
+    if check_df.empty:
+        st.write("No CHECK items generated.")
+    else:
+        st.dataframe(check_df, use_container_width=True)
+
+    # Warnings if any standard lengths missing and no override (showed as fallback usage)
+    missing = []
+    for d in unique_desc:
+        if d not in st.session_state.std_overrides and STANDARD_LENGTHS.get(d) is None:
+            missing.append(d)
+    if missing:
+        with st.expander("⚠️ Descriptions without known standard length (consider adding overrides)"):
+            for m in missing:
+                st.warning(f"{m} — example: {df_work.loc[df_work['desc_norm']==m,'Description'].iloc[0]}")
+
+    # Export to Excel
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        if not buy_df.empty:
+            buy_df.to_excel(writer, sheet_name="BUY", index=False)
+        else:
+            pd.DataFrame().to_excel(writer, sheet_name="BUY", index=False)
+        if not check_df.empty:
+            check_df.to_excel(writer, sheet_name="CHECK", index=False)
+        else:
+            pd.DataFrame().to_excel(writer, sheet_name="CHECK", index=False)
+    out.seek(0)
+    st.download_button("⬇️ Download Excel output", data=out, file_name="Steel_Optimiser_Output.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    st.success("Processing complete.")
