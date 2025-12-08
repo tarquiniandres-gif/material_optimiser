@@ -202,40 +202,47 @@ if st.button("🚀 Process BOM"):
     st.header("📦 Optimisation Results")
 
     if bundle_option == "Bulk (all cuts combined)":
-        # Bulk mode: group by Description only
-        grouped = df_source.groupby("Description")
+    grouped = df_source.groupby("Material")
+else:
+    grouped = df_source.groupby(["Parent", "Material"])
+
+for group, subdf in grouped:
+
+    # -------- Determine material key --------
+    if isinstance(group, tuple):
+        parent, material_key = group
+        st.subheader(f"Parent: {parent} | Material: {material_key}")
     else:
-        # By parent
-        grouped = df_source.groupby(["Parent", "Description"])
+        material_key = group
+        st.subheader(f"Material: {material_key}")
 
-    for group, subdf in grouped:
-        st.subheader(f"Group: {group}")
+    # Validate numeric columns
+    try:
+        subdf2 = subdf.copy()
+        subdf2["Length"] = subdf2["Length"].astype(float)
+        subdf2["Qty"] = subdf2["Qty"].astype(float)
+    except:
+        st.error("Length & Qty must be numeric.")
+        continue
 
-        # Need material + length + qty columns
-        try:
-            subdf2 = subdf.copy()
-            subdf2["Length"] = subdf2["Length"].astype(float)
-            subdf2["Qty"] = subdf2["Qty"].astype(float)
-        except:
-            st.error("Length/Qty must be numeric.")
-            continue
+    # Expand quantities into individual cut entries
+    expanded = subdf2.loc[subdf2.index.repeat(subdf2["Qty"])]
 
-        # Expand quantities into individual cuts
-        expanded = subdf2.loc[subdf2.index.repeat(subdf2["Qty"])]
+    # -------- Call optimiser with actual material key --------
+    result = optimise_material(material_key, expanded)
 
-        material = group[1] if isinstance(group, tuple) else group
+    # Show message if no length
+    if result["std_length"] is None:
+        st.warning(result["message"])
+        continue
 
-        result = optimise_material(material, expanded)
+    st.write(f"Standard length: **{result['std_length']} mm**")
+    st.write(f"Bars required: **{result['qty_required']}**")
 
-        if result["std_length"] is None:
-            st.warning(result["message"])
-            continue
+    # Show cut pattern
+    for i, cuts in enumerate(result["cuts"], start=1):
+        st.write(
+            f"Bar {i}: {cuts} → Used {sum(cuts)} mm | Waste {result['std_length'] - sum(cuts)} mm"
+        )
 
-        st.write(f"Standard length: **{result['std_length']} mm**")
-        st.write(f"Bars required: **{result['qty_required']}**")
-
-        # Show cut pattern
-        for i, cuts in enumerate(result["cuts"], start=1):
-            st.write(f"Bar {i}: {cuts} → Used: {sum(cuts)} mm | Waste: {result['std_length'] - sum(cuts)} mm")
-
-        st.divider()
+    st.divider()
