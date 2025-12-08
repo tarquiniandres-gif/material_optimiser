@@ -77,7 +77,13 @@ def optimise_cuts(cut_lengths, std_length):
     offcuts = [std_length - sum(bar) for bar in bars]
     return len(bars), offcuts, bars
 
-def process_group(df_group):
+def process_group(df_group, overrides, default_stock_length):
+    """
+    overrides: dict mapping desc_norm -> either
+       - integer (stock length in mm)
+       - None (means CUT-TO-LENGTH)
+       - missing (no override)
+    """
     buy_rows, check_rows = [], []
     df = df_group.copy()
     df["desc_clean"] = df["description"].apply(normalise)
@@ -94,8 +100,24 @@ def process_group(df_group):
                 cuts.extend([math.ceil(length * WASTE_FACTOR)] * qty)
             except:
                 continue
-        std_length = STANDARD_LENGTHS.get(desc_norm)
-        if std_length is None and "200PFC" not in desc_norm:
+
+        # Determine std_length using overrides -> STANDARD_LENGTHS -> default_stock_length
+        if desc_norm in overrides:
+            std_override = overrides[desc_norm]
+            if std_override == "CUT":   # user chose cut-to-length
+                std_length = None
+            else:
+                try:
+                    std_length = int(std_override) if std_override is not None and str(std_override) != "" else STANDARD_LENGTHS.get(desc_norm)
+                except:
+                    std_length = STANDARD_LENGTHS.get(desc_norm)
+        else:
+            std_length = STANDARD_LENGTHS.get(desc_norm)
+
+        # If still missing and STANDARD_LENGTHS has None because of 200PFC, keep None
+        # If still missing entirely, we'll warn and mark UNKNOWN
+        if std_length is None and "200PFC" not in desc_norm and desc_norm not in STOCK_LIST and desc_norm not in overrides:
+            # warn: no standard length known and no override supplied
             buy_rows.append({
                 "Description": desc_display,
                 "Standard Bar Length (mm)": "UNKNOWN",
@@ -103,11 +125,25 @@ def process_group(df_group):
                 "Bars Required": "UNKNOWN",
                 "Avg Offcut (mm)": "UNKNOWN",
                 "Cutting Patterns": "UNKNOWN",
-                "_warning": f"No standard length found for {desc_display}"
+                "_warning": f"No standard length found for {desc_display}. Set a stock length before processing."
             })
             continue
+
+        # Now use std_length: if user set CUT (None) or STANDARD_LENGTHS is None -> treat as cut-to-length
         if "200PFC" in desc_norm:
             std_length = None
+
+        # If material is a stock list item but std_length None -> treat as unknown
+        if desc_norm in STOCK_LIST and std_length is None:
+            # cannot compute bars_equiv reliably
+            total_length = sum(cuts)
+            check_rows.append({
+                "Description": desc_display,
+                "Total Length (mm)": total_length,
+                "Approx. Bars Equivalent": "UNKNOWN (no stock length set)"
+            })
+            continue
+
         if desc_norm in STOCK_LIST:
             total_length = sum(cuts)
             bars_equiv = total_length / (std_length or 1)
@@ -133,11 +169,13 @@ def try_parse_paste(paste_text):
     s = StringIO(paste_text.strip())
     for sep in [",","\t",";"]:
         try:
+            s.seek(0)
             df = pd.read_csv(s, sep=sep)
             if {"description","length","qty"} <= set(c.lower() for c in df.columns):
                 return df
         except:
             continue
+    # final attempt: infer
     df = pd.read_csv(StringIO(paste_text))
     if {"description","length","qty"} <= set(c.lower() for c in df.columns):
         return df
@@ -170,6 +208,37 @@ with st.expander("Sample BOM CSV"):
         "100x50x3RHS,1500,2,Parent B\n"
     )
 
+# Sidebar: global default and add-new-material
+st.sidebar.subheader("Stock length settings")
+default_stock_length = st.sidebar.number_input(
+    "Default stock length for materials (mm)",
+    min_value=100,
+    max_value=20000,
+    value=6000,
+    step=100,
+    help="Used when no standard or override is provided."
+)
+
+st.sidebar.markdown("**Add / override material (session only)**")
+new_material = st.sidebar.text_input("Material name (free text)")
+new_material_len = st.sidebar.text_input("Stock length for this material (mm or 'CUT')", value="")
+if st.sidebar.button("Add / Update material"):
+    key = normalise(new_material)
+    if key:
+        # allow 'CUT' to set None explicitly
+        if str(new_material_len).strip().upper() == "CUT":
+            STANDARD_LENGTHS[key] = None
+        else:
+            try:
+                STANDARD_LENGTHS[key] = int(float(new_material_len))
+            except:
+                # fallback to default
+                STANDARD_LENGTHS[key] = default_stock_length
+        st.sidebar.success(f"Added/Updated material {key} -> {STANDARD_LENGTHS[key]}")
+    else:
+        st.sidebar.error("Enter a material name to add/update.")
+
+# Input tabs
 tab1, tab2 = st.tabs(["Paste BOM", "Upload file"])
 paste_df = None
 uploaded_df = None
@@ -181,18 +250,13 @@ with tab1:
     if paste_text.strip():
         try:
             lines = paste_text.strip().split("\n")
-            # detect separator: tab or comma
             sep = "\t" if "\t" in lines[0] else ","
-            # convert to DataFrame
-            df_temp = pd.DataFrame([l.split(sep) for l in lines[1:]], columns=lines[0].split(sep))
-            # strip spaces from column names
-            df_temp.columns = [c.strip() for c in df_temp.columns]
-            # editable table
+            df_temp = pd.DataFrame([l.split(sep) for l in lines[1:]], columns=[c.strip() for c in lines[0].split(sep)])
             st.write("✅ Review / edit pasted BOM below")
+            # editable table - user can fix columns/types before processing
             paste_df = st.data_editor(df_temp, num_rows="dynamic")
         except Exception as e:
             st.error(f"Error parsing pasted BOM: {e}")
-
 
 with tab2:
     uploaded_file = st.file_uploader("Upload BOM file", type=["xlsx","xls","csv"])
@@ -236,6 +300,46 @@ if process_btn:
                 st.error("Could not interpret Qty column as numeric integers.")
                 st.stop()
 
+            # BEFORE processing: allow user to edit/confirm stock lengths per material
+            # Build list of unique materials found
+            df_proc["desc_clean"] = df_proc["description"].apply(normalise)
+            materials = df_proc["desc_clean"].unique().tolist()
+
+            st.info("Set or confirm stock length for each material (leave blank to use known standard or default).")
+            overrides = {}  # desc_norm -> int or "CUT" or None
+
+            with st.expander("Material stock lengths (click to edit)"):
+                for mat in materials:
+                    # readable name from first occurrence
+                    display_name = df_proc.loc[df_proc["desc_clean"] == mat, "description"].iloc[0]
+                    detected = STANDARD_LENGTHS.get(mat, "(no standard)")
+                    # default shown value: detected standard or default stock length
+                    col_a, col_b, col_c = st.columns([4,2,2])
+                    with col_a:
+                        st.markdown(f"**{display_name}** — key: `{mat}`")
+                    with col_b:
+                        # text input to allow free typing or 'CUT' to mark cut-to-length
+                        user_val = st.text_input(f"Stock length (mm) for {mat}", key=f"len_{mat}", value=str(detected) if detected is not None else "")
+                    with col_c:
+                        cut_box = st.checkbox(f"Cut-to-length (no stock bar)", key=f"cut_{mat}", value=(detected is None))
+                    # Decide override
+                    if cut_box:
+                        overrides[mat] = "CUT"
+                    else:
+                        val = user_val.strip()
+                        if val == "":
+                            # leave absent -> no override (use STANDARD_LENGTHS or default later)
+                            # we don't set overrides entry
+                            pass
+                        else:
+                            # try parse numeric
+                            try:
+                                overrides[mat] = int(float(val))
+                            except:
+                                # invalid -> ignore and warn
+                                st.warning(f"Invalid length for {mat}: '{val}'. Ignored; will use standard/default.")
+                st.markdown("If you want to use a single global default for any material without a standard, set it in the sidebar.")
+
             st.info("Processing BOM...")
             buy_rows_all = []
             check_rows_all = []
@@ -246,7 +350,7 @@ if process_btn:
                 for parent in parents:
                     sub = df_proc[df_proc["parent"].fillna("")==parent].copy()
                     if sub.empty: continue
-                    buy_rows, check_rows = process_group(sub)
+                    buy_rows, check_rows = process_group(sub, overrides, default_stock_length)
                     for r in buy_rows:
                         r["Parent"] = parent if parent!="" else "(No Parent)"
                         if "_warning" in r:
@@ -257,7 +361,7 @@ if process_btn:
                     buy_rows_all.extend(buy_rows)
                     check_rows_all.extend(check_rows)
             else:
-                buy_rows, check_rows = process_group(df_proc)
+                buy_rows, check_rows = process_group(df_proc, overrides, default_stock_length)
                 for r in buy_rows:
                     r["Parent"] = "(Bulk)"
                     if "_warning" in r:
