@@ -59,9 +59,9 @@ STOCK_LIST = [normalise(k) for k in RAW_STOCK_LIST]
 
 # --- Streamlit session-state safe initialisation
 st.set_page_config(page_title="Steel Optimiser", layout="wide")
-for key in ["std_overrides","custom_materials","paste_df","uploaded_df"]:
+for key in ["std_overrides", "custom_materials", "paste_df", "uploaded_df"]:
     if key not in st.session_state:
-        st.session_state[key] = {} if "std_overrides"==key or "custom_materials"==key else None
+        st.session_state[key] = {} if key in ("std_overrides", "custom_materials") else None
 
 # --- helper algorithms
 def best_fit_decreasing(cuts, bar_length):
@@ -80,8 +80,7 @@ def best_fit_decreasing(cuts, bar_length):
 
 def optimise_cuts(cut_lengths, std_length):
     if std_length is None:
-        total_length = sum(cut_lengths)
-        return len(cut_lengths), [0]*len(cut_lengths), [[c] for c in cut_lengths]
+        return len(cut_lengths), [0] * len(cut_lengths), [[c] for c in cut_lengths]
     bars = best_fit_decreasing(cut_lengths, std_length)
     offcuts = [std_length - sum(bar) for bar in bars]
     return len(bars), offcuts, bars
@@ -123,7 +122,7 @@ multiplier = st.number_input(
 )
 
 # --- Input tabs
-tab1, tab2 = st.tabs(["Paste BOM","Upload file"])
+tab1, tab2 = st.tabs(["Paste BOM", "Upload file"])
 
 with tab1:
     paste_text = st.text_area("Paste BOM here (with headers)", height=220)
@@ -138,7 +137,7 @@ with tab1:
             st.error(str(e))
 
 with tab2:
-    uploaded_file = st.file_uploader("Upload CSV/XLSX", type=["csv","xls","xlsx"])
+    uploaded_file = st.file_uploader("Upload CSV/XLSX", type=["csv", "xls", "xlsx"])
     if uploaded_file:
         try:
             if uploaded_file.name.lower().endswith(".csv"):
@@ -159,16 +158,18 @@ if df_source is None:
 
 # --- Standard column names
 cols_map = {c.lower(): c for c in df_source.columns}
-required = {"description","length","qty"}
+required = {"description", "length", "qty"}
 if not required <= set(cols_map.keys()):
     st.error("BOM must include Description, Length, Qty")
     st.stop()
 
-df_work = df_source.rename(columns={cols_map["description"]:"Description",
-                                    cols_map["length"]:"Length",
-                                    cols_map["qty"]:"Qty"})
-df_work["Parent"] = df_work.get("Parent","")
-df_work["Material"] = df_work.get("Material","")
+df_work = df_source.rename(columns={
+    cols_map["description"]: "Description",
+    cols_map["length"]: "Length",
+    cols_map["qty"]: "Qty"
+})
+df_work["Parent"] = df_work.get("Parent", "")
+df_work["Material"] = df_work.get("Material", "")
 df_work["desc_norm"] = df_work["Description"].apply(normalise)
 
 # --- Apply multiplier to Qty
@@ -183,26 +184,27 @@ st.header("Material length confirmation")
 st.markdown("Override stock length for any material (type CUT for cut-to-length).")
 unique_desc = df_work["desc_norm"].unique().tolist()
 for desc in unique_desc:
-    display = df_work.loc[df_work["desc_norm"]==desc,"Description"].iloc[0]
+    display = df_work.loc[df_work["desc_norm"] == desc, "Description"].iloc[0]
     std_known = STANDARD_LENGTHS.get(desc)
-    override_val = st.session_state.std_overrides.get(desc,None)
+    override_val = st.session_state.std_overrides.get(desc, None)
     default_str = ""
-    if override_val=="CUT":
+    if override_val == "CUT":
         default_str = "CUT"
     elif override_val is not None:
         default_str = str(override_val)
     elif std_known is not None:
         default_str = str(std_known)
-    col1,col2 = st.columns([4,2])
+
+    col1, col2 = st.columns([4, 2])
     with col1:
         st.write(f"**{display}**  — key: `{desc}`")
     with col2:
         inp = st.text_input(f"Length for {desc}", value=default_str, key=f"len_{desc}")
         val = inp.strip().upper()
-        if val=="":
-            st.session_state.std_overrides.pop(desc,None)
-        elif val=="CUT":
-            st.session_state.std_overrides[desc]="CUT"
+        if val == "":
+            st.session_state.std_overrides.pop(desc, None)
+        elif val == "CUT":
+            st.session_state.std_overrides[desc] = "CUT"
         else:
             try:
                 st.session_state.std_overrides[desc] = int(float(val))
@@ -212,14 +214,14 @@ for desc in unique_desc:
 # --- Process BOM
 if st.button("Process BOM"):
     st.info("Processing BOM...")
-    buy_rows=[]
-    check_rows=[]
-    warnings=[]
+    buy_rows = []
+    check_rows = []
+    warnings = []
 
-    procure_mode = st.radio("Procure by", ["Bulk (group by Description)","By Parent (bundle per Parent)"], index=0)
+    procure_mode = st.radio("Procure by", ["Bulk (group by Description)", "By Parent (bundle per Parent)"], index=0)
 
     if procure_mode.startswith("By Parent"):
-        grouped = df_work.groupby(["Parent","desc_norm"], as_index=False)
+        grouped = df_work.groupby(["Parent", "desc_norm"], as_index=False)
     else:
         grouped = df_work.groupby("desc_norm", as_index=False)
 
@@ -227,7 +229,7 @@ if st.button("Process BOM"):
         if procure_mode.startswith("By Parent"):
             parent, desc_norm = group_key
             readable = group_df["Description"].iloc[0]
-            parent_label = parent if parent not in (None,"") else "(No Parent)"
+            parent_label = parent if parent not in (None, "") else "(No Parent)"
         else:
             desc_norm = group_key
             readable = group_df["Description"].iloc[0]
@@ -236,67 +238,71 @@ if st.button("Process BOM"):
         group_df["Length"] = pd.to_numeric(group_df["Length"], errors="coerce")
         group_df["Qty"] = pd.to_numeric(group_df["Qty"], errors="coerce").fillna(0).astype(int)
 
+        # --- Build cuts: nominal (report) vs effective (internal optimisation)
         cuts_nominal = []
-cuts_effective = []
+        cuts_effective = []
 
-for _, r in group_df.iterrows():
-    if pd.isna(r["Length"]) or r["Qty"] <= 0:
-        continue
+        for _, r in group_df.iterrows():
+            if pd.isna(r["Length"]) or r["Qty"] <= 0:
+                continue
+            L = float(r["Length"])
+            q = int(r["Qty"])
+            cuts_nominal.extend([math.ceil(L)] * q)
+            cuts_effective.extend([math.ceil(L * WASTE_FACTOR)] * q)
 
-    L = float(r["Length"])
-    q = int(r["Qty"])
-
-    # What cutting & BOM should follow
-    cuts_nominal.extend([math.ceil(L)] * q)
-
-    # Internal only (waste accounted)
-    cuts_effective.extend([math.ceil(L * WASTE_FACTOR)] * q)
-
-if not cuts_nominal:
-    continue
+        if not cuts_nominal:
+            continue
 
         # Determine standard length
         std_len = None
         if desc_norm in st.session_state.std_overrides:
             val = st.session_state.std_overrides[desc_norm]
-            if val=="CUT":
-                std_len=None
+            if val == "CUT":
+                std_len = None
             else:
                 std_len = val
         else:
-            std_len = STANDARD_LENGTHS.get(desc_norm,None)
+            std_len = STANDARD_LENGTHS.get(desc_norm, None)
 
-        explicit_cut = (desc_norm in st.session_state.std_overrides and st.session_state.std_overrides[desc_norm]=="CUT")
+        explicit_cut = (
+            desc_norm in st.session_state.std_overrides
+            and st.session_state.std_overrides[desc_norm] == "CUT"
+        )
+
         if explicit_cut:
-            bars_needed=len(cuts)
-            offcuts=[0]*bars_needed
-            patterns=[[c] for c in cuts]
+            bars_needed = len(cuts_nominal)
+            patterns_nominal = [[c] for c in cuts_nominal]
             buy_rows.append({
                 "Parent": parent_label if parent_label else "(Bulk)",
                 "Description": readable,
-                "Standard Bar Length (mm)":"CUT-TO-LENGTH",
-                "Total Cuts":len(cuts),
-                "Bars Required":bars_needed,
-                "Avg Offcut (mm)":0,
-               "Cutting Patterns": str(patterns_nominal)
+                "Standard Bar Length (mm)": "CUT-TO-LENGTH",
+                "Total Cuts": len(cuts_nominal),
+                "Bars Required": bars_needed,
+                "Avg Offcut (mm)": 0,
+                "Cutting Patterns": str(patterns_nominal)
             })
             continue
 
         used_len = std_len if std_len is not None else 6000  # fallback
+
+        # Optimise using effective lengths (waste factor internal only)
         bars_needed, offcuts, patterns_effective = optimise_cuts(cuts_effective, used_len)
-        avg_off = round(sum(offcuts)/len(offcuts),1) if offcuts else 0
-patterns_nominal = []
-idx = 0
-for bar in patterns_effective:
-    bar_nom = []
-    for _ in bar:
-        bar_nom.append(cuts_nominal[idx])
-        idx += 1
-    patterns_nominal.append(bar_nom)
+        avg_off = round(sum(offcuts) / len(offcuts), 1) if offcuts else 0
+
+        # Convert grouping back to nominal lengths for reporting
+        patterns_nominal = []
+        idx = 0
+        for bar in patterns_effective:
+            bar_nom = []
+            for _ in bar:
+                bar_nom.append(cuts_nominal[idx])
+                idx += 1
+            patterns_nominal.append(bar_nom)
 
         if desc_norm in STOCK_LIST:
-            total_length = sum(cuts_effective)
-            approx_bars = round(total_length/used_len,2)
+            # CHECK to match BOM lengths (not waste-inflated)
+            total_length = sum(cuts_nominal)
+            approx_bars = round(total_length / used_len, 2)
             check_rows.append({
                 "Parent": parent_label if parent_label else "(Bulk)",
                 "Description": readable,
@@ -308,26 +314,26 @@ for bar in patterns_effective:
                 "Parent": parent_label if parent_label else "(Bulk)",
                 "Description": readable,
                 "Standard Bar Length (mm)": used_len,
-                "Total Cuts": len(cuts_effective),
+                "Total Cuts": len(cuts_nominal),
                 "Bars Required": bars_needed,
                 "Avg Offcut (mm)": avg_off,
                 "Cutting Patterns": str(patterns_nominal)
             })
 
-    buy_df=pd.DataFrame(buy_rows)
-    check_df=pd.DataFrame(check_rows)
+    buy_df = pd.DataFrame(buy_rows)
+    check_df = pd.DataFrame(check_rows)
 
     st.subheader("📦 BUY LIST")
     if buy_df.empty:
         st.write("No BUY items generated.")
     else:
-        st.dataframe(buy_df,use_container_width=True)
+        st.dataframe(buy_df, use_container_width=True)
 
     st.subheader("📘 CHECK (Stock Materials)")
     if check_df.empty:
         st.write("No CHECK items generated.")
     else:
-        st.dataframe(check_df,use_container_width=True)
+        st.dataframe(check_df, use_container_width=True)
 
     # Export
     out = BytesIO()
@@ -341,5 +347,10 @@ for bar in patterns_effective:
         else:
             pd.DataFrame().to_excel(writer, sheet_name="CHECK", index=False)
     out.seek(0)
-    st.download_button("⬇️ Download Excel output", data=out, file_name="Steel_Optimiser_Output.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(
+        "⬇️ Download Excel output",
+        data=out,
+        file_name="Steel_Optimiser_Output.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
     st.success("Processing complete.")
