@@ -235,13 +235,25 @@ if st.button("Process BOM"):
 
         group_df["Length"] = pd.to_numeric(group_df["Length"], errors="coerce")
         group_df["Qty"] = pd.to_numeric(group_df["Qty"], errors="coerce").fillna(0).astype(int)
-        cuts=[]
-        for _, r in group_df.iterrows():
-            if pd.isna(r["Length"]) or r["Qty"]<=0:
-                continue
-            cuts.extend([math.ceil(float(r["Length"])*WASTE_FACTOR)]*r["Qty"])
 
-        if not cuts: continue
+        cuts_nominal = []
+cuts_effective = []
+
+for _, r in group_df.iterrows():
+    if pd.isna(r["Length"]) or r["Qty"] <= 0:
+        continue
+
+    L = float(r["Length"])
+    q = int(r["Qty"])
+
+    # What cutting & BOM should follow
+    cuts_nominal.extend([math.ceil(L)] * q)
+
+    # Internal only (waste accounted)
+    cuts_effective.extend([math.ceil(L * WASTE_FACTOR)] * q)
+
+if not cuts_nominal:
+    continue
 
         # Determine standard length
         std_len = None
@@ -266,16 +278,24 @@ if st.button("Process BOM"):
                 "Total Cuts":len(cuts),
                 "Bars Required":bars_needed,
                 "Avg Offcut (mm)":0,
-                "Cutting Patterns":str(patterns)
+               "Cutting Patterns": str(patterns_nominal)
             })
             continue
 
         used_len = std_len if std_len is not None else 6000  # fallback
-        bars_needed, offcuts, patterns = optimise_cuts(cuts, used_len)
+        bars_needed, offcuts, patterns_effective = optimise_cuts(cuts_effective, used_len)
         avg_off = round(sum(offcuts)/len(offcuts),1) if offcuts else 0
+patterns_nominal = []
+idx = 0
+for bar in patterns_effective:
+    bar_nom = []
+    for _ in bar:
+        bar_nom.append(cuts_nominal[idx])
+        idx += 1
+    patterns_nominal.append(bar_nom)
 
         if desc_norm in STOCK_LIST:
-            total_length = sum(cuts)
+            total_length = sum(cuts_effective)
             approx_bars = round(total_length/used_len,2)
             check_rows.append({
                 "Parent": parent_label if parent_label else "(Bulk)",
@@ -288,10 +308,10 @@ if st.button("Process BOM"):
                 "Parent": parent_label if parent_label else "(Bulk)",
                 "Description": readable,
                 "Standard Bar Length (mm)": used_len,
-                "Total Cuts": len(cuts),
+                "Total Cuts": len(cuts_effective),
                 "Bars Required": bars_needed,
                 "Avg Offcut (mm)": avg_off,
-                "Cutting Patterns": str(patterns)
+                "Cutting Patterns": str(patterns_nominal)
             })
 
     buy_df=pd.DataFrame(buy_rows)
