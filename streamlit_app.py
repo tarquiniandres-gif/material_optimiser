@@ -148,7 +148,12 @@ with tab2:
         df_up = st.data_editor(df_up, num_rows="dynamic")
         st.session_state.uploaded_df = df_up
 
-df_source = st.session_state.paste_df or st.session_state.uploaded_df
+df_source = (
+    st.session_state.paste_df
+    if st.session_state.paste_df is not None
+    else st.session_state.uploaded_df
+)
+
 if df_source is None:
     st.stop()
 
