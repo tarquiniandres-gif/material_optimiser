@@ -215,15 +215,11 @@ if st.button("Process BOM"):
         total_used = sum(sum(bar) for bar in patterns_eff)
         total_available = bars * std_len
         efficiency = round((total_used / total_available) * 100, 1) if bars > 0 else 0
-
-        patterns_nom = []
-        idx = 0
-        for bar in patterns_eff:
-            bar_nom = []
-            for _ in bar:
-                bar_nom.append(cuts_nom[idx])
-                idx += 1
-            patterns_nom.append(bar_nom)
+       
+        patterns_nom = [
+            [math.ceil(c / WASTE_FACTOR) for c in bar]
+            for bar in patterns_eff
+        ]
 
         buy_rows.append({
             "Description": g["Description"].iloc[0],
