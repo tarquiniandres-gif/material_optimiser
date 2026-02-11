@@ -215,8 +215,6 @@ if st.button("Process BOM"):
         total_used = sum(sum(bar) for bar in patterns_eff)
         total_available = bars * std_len
         efficiency = round((total_used / total_available) * 100, 1) if bars > 0 else 0
-        "Efficiency %": efficiency,
-        "Total Waste": sum(offcuts),
 
         patterns_nom = []
         idx = 0
@@ -231,6 +229,8 @@ if st.button("Process BOM"):
             "Description": g["Description"].iloc[0],
             "Standard Bar Length": std_len,
             "Bars Required": bars,
+            "Efficiency %": efficiency,
+            "Total Waste (mm)": sum(offcuts),
             "Avg Offcut": round(sum(offcuts) / len(offcuts), 1),
             "Cutting Patterns": patterns_nom
         })
