@@ -62,50 +62,70 @@ for key in ["std_overrides", "paste_df", "uploaded_df"]:
         st.session_state[key] = None if "df" in key else {}
 
 # =========================================================
-# ✅ APPROVED CUT OPTIMISER (First-Fit Decreasing, bar by bar)
+# ✅ BULK SHOP-FLOOR OPTIMISER (True First-Fit Decreasing)
 # =========================================================
 def optimise_cuts(cut_lengths, std_length):
     """
-    Human-friendly optimiser:
-    - Sort cuts longest → shortest
-    - Fill one bar at a time
-    - Skip cuts that don't fit
-    - Use smaller cuts to consume offcuts
+    Bulk optimiser per material.
+    - True First-Fit Decreasing (FFD)
+    - Works bar-by-bar
+    - Handles kerf correctly
+    - Deterministic & shop-floor friendly
     """
 
     if std_length is None:
+        # If no standard length defined, assume 1 cut per bar
         return len(cut_lengths), [0] * len(cut_lengths), [[c] for c in cut_lengths]
 
+    # ---------------------------------------------------
+    # STEP 1: Sort cuts longest → shortest
+    # ---------------------------------------------------
     cuts = sorted(cut_lengths, reverse=True)
+
+    # Each bar will store:
+    # {
+    #   "remaining": mm left,
+    #   "cuts": [list of cuts]
+    # }
     bars = []
 
-    while cuts:
-        remaining = std_length
-        bar = []
+    # ---------------------------------------------------
+    # STEP 2: Place each cut into first bar that fits
+    # ---------------------------------------------------
+    for cut in cuts:
 
-        # Always take the largest remaining cut first
-        first = cuts[0]
-        if first > remaining:
-            raise ValueError(f"Cut {first}mm longer than bar {std_length}mm")
+        if cut > std_length:
+            raise ValueError(f"Cut {cut}mm longer than bar {std_length}mm")
 
-        bar.append(first)
-        remaining -= first + KERF
-        cuts.pop(0)
+        placed = False
 
-        # Fill bar with anything that fits
-        i = 0
-        while i < len(cuts):
-            if cuts[i] <= remaining:
-                bar.append(cuts[i])
-                remaining -= cuts[i] + KERF
-                cuts.pop(i)
-            else:
-                i += 1
+        for bar in bars:
 
-        bars.append(bar)
+            # Space needed includes kerf if bar already has cuts
+            space_needed = cut
+            if len(bar["cuts"]) > 0:
+                space_needed += KERF
 
-    offcuts = [std_length - sum(bar) for bar in bars]
-    return len(bars), offcuts, bars
+            if bar["remaining"] >= space_needed:
+                bar["cuts"].append(cut)
+                bar["remaining"] -= space_needed
+                placed = True
+                break
+
+        # If no bar could take it → open new bar
+        if not placed:
+            bars.append({
+                "cuts": [cut],
+                "remaining": std_length - cut
+            })
+
+    # ---------------------------------------------------
+    # STEP 3: Prepare outputs
+    # ---------------------------------------------------
+    patterns = [bar["cuts"] for bar in bars]
+    offcuts = [bar["remaining"] for bar in bars]
+
+    return len(bars), offcuts, patterns
 
 # --- BOM paste parser
 def try_parse_paste(paste_text):
@@ -192,6 +212,11 @@ if st.button("Process BOM"):
             cuts_eff.extend([math.ceil(r["Length"] * WASTE_FACTOR)] * r["Qty"])
 
         bars, offcuts, patterns_eff = optimise_cuts(cuts_eff, std_len)
+        total_used = sum(sum(bar) for bar in patterns_eff)
+        total_available = bars * std_len
+        efficiency = round((total_used / total_available) * 100, 1) if bars > 0 else 0
+        "Efficiency %": efficiency,
+        "Total Waste": sum(offcuts),
 
         patterns_nom = []
         idx = 0
