@@ -5,7 +5,7 @@ import math
 from io import StringIO, BytesIO
 
 # === CONFIG ===
-WASTE_FACTOR = 1.03   # internal only
+WASTE_FACTOR = 1.005   # internal only
 KERF = 0              # set to e.g. 3 if you want saw allowance per cut
 
 RAW_STANDARD_LENGTHS = {
